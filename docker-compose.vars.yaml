@@ -1,0 +1,29 @@
+---
+# Inject environment variables
+
+version: "3.8"
+services:
+
+  postgres:
+    env_file:
+      - "back/.env"
+
+  back:
+    env_file:
+      - "back/.env"
+
+  state-machine:
+    env_file:
+      - "sdk/.env"
+
+  ray:
+    env_file:
+      - "back/.env"
+
+  widget:
+    env_file:
+      - "widget/.env"
+
+  admin:
+    env_file:
+      - "admin/.env"

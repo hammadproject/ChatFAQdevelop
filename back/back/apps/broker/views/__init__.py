@@ -1,0 +1,425 @@
+from datetime import datetime
+from io import BytesIO
+from zipfile import ZipFile
+
+import django_filters
+from django.db.models import Avg, Count, Q
+from django.db.models.functions import Trunc
+from django.http import HttpResponse, JsonResponse
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import exceptions, mixins, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.filters import OrderingFilter, SearchFilter
+from rest_framework.generics import CreateAPIView, UpdateAPIView
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.viewsets import GenericViewSet
+
+from back.config.storage_backends import select_private_storage
+
+from ...language_model.stats import calculate_general_stats, calculate_response_stats
+from ..models import ConsumerRoundRobinQueue
+from ..models.message import AdminReview, AgentType, Conversation, Message, UserFeedback
+from ..serializers import (
+    AdminReviewSerializer,
+    ConsumerRoundRobinQueueSerializer,
+    ConversationMessagesSerializer,
+    ConversationSerializer,
+    StatsSerializer,
+    UserFeedbackSerializer,
+)
+from ..serializers.messages import MessageSerializer
+
+
+class ConversationFilterSet(django_filters.FilterSet):
+    reviewed = django_filters.CharFilter(method='filter_reviewed')
+    fsm_def = django_filters.CharFilter(method='filter_fsm_def')
+    user_feedback_exists = django_filters.BooleanFilter(method='filter_user_feedback_exists')
+
+    class Meta:
+        model = Conversation
+        fields = {
+           'created_date': ['lte', 'gte'],
+           'id': ['exact'],
+        }
+
+    def filter_fsm_def(self, queryset, name, value):
+        return queryset.filter(message__stack__0__contains=[{'fsm_definition': value}]).distinct()
+
+    def filter_reviewed(self, queryset, name, value):
+        val = True
+        if value == "completed":
+            val = False
+        if val:
+            return queryset.filter(message__adminreview__isnull=val).exclude(message__adminreview__isnull=not val).distinct()
+        return queryset.filter(message__adminreview__isnull=val).distinct()
+
+    def filter_user_feedback_exists(self, queryset, name, value):
+        return queryset.filter(
+            message__in=Message.objects.filter(
+                Q(source_userfeedback_set__isnull=False) | Q(target_userfeedback_set__isnull=False)
+            )
+        ).distinct()
+
+
+class ConversationAPIViewSet(
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    mixins.ListModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    queryset = Conversation.objects.all()
+    serializer_class = ConversationSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    search_fields = ['name']
+    filterset_class = ConversationFilterSet
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return ConversationMessagesSerializer
+        return super().get_serializer_class()
+
+    def get_permissions(self):
+        if self.action is not None and (self.action == 'retrieve' or self.action == 'destroy' or 'update' in self.action):
+            return [AllowAny(), ]
+        return super(ConversationAPIViewSet, self).get_permissions()
+
+    @staticmethod
+    def _instance_permissions(instance, request):
+        if instance and instance.authentication_required:
+            if not request.user.is_authenticated:
+                return JsonResponse(
+                    {"error": "Authentication required"},
+                    status=401,
+                )
+
+    def instance_permissions(self, request):
+        return self._instance_permissions(self.get_object(), request)
+
+    @action(methods=("get",), detail=False, permission_classes=[AllowAny])
+    def from_sender(self, request, *args, **kwargs):
+        # Use authenticated user's sender_uuid if available, otherwise fall back to query param
+        if request.user.is_authenticated:
+            sender_id = str(request.user.sender_uuid)
+        else:
+            sender_id = request.query_params.get("sender")
+            if not sender_id:
+                return JsonResponse(
+                    {"error": "sender is required"},
+                    status=400,
+                )
+
+        results = []
+        for c in Conversation.conversations_from_sender(sender_id):
+            if error := self._instance_permissions(c, request):
+                return error
+            results.append(ConversationSerializer(c).data)
+
+        return JsonResponse(
+            results,
+            safe=False,
+        )
+
+    @action(methods=("get",), detail=True)
+    def review_progress(self, request, pk=None):
+        conv = Conversation.objects.get(pk=pk)
+        if error := self._instance_permissions(conv, request):
+            return error
+
+        return JsonResponse(
+            conv.get_review_progress(),
+            safe=False,
+        )
+
+    @action(methods=("post",), detail=True, permission_classes=[AllowAny])
+    def download(self, request, *args, **kwargs):
+        """
+        A view to download all the knowledge base's items as a csv file:
+        """
+        ids = kwargs["pk"].split(",")
+        if len(ids) == 1:
+            conv = Conversation.objects.get(pk=ids[0])
+            if error := self._instance_permissions(conv, request):
+                return error
+            content = conv.conversation_to_text()
+            filename = f"{conv.created_date.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+            content_type = "text/plain"
+        else:
+            zip_content = BytesIO()
+            with ZipFile(zip_content, "w") as _zip:
+                for _id in ids:
+                    conv = Conversation.objects.get(pk=_id)
+                    if error := self._instance_permissions(conv, request):
+                        return error
+                    _content = conv.conversation_to_text()
+                    _zip.writestr(
+                        conv.get_first_msg().created_date.strftime("%Y-%m-%d_%H-%M-%S")
+                        + ".txt",
+                        _content,
+                    )
+
+            filename = f"{datetime.today().strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+            content_type = "application/x-zip-compressed"
+            content = zip_content.getvalue()
+
+        response = HttpResponse(content, content_type=content_type)
+        response["Content-Disposition"] = "attachment; filename={0}".format(filename)
+        response["Access-Control-Expose-Headers"] = "Content-Disposition"
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        if error := self.instance_permissions(request):
+            return error
+        return super().retrieve(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        if error := self.instance_permissions(request):
+            return error
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if error := self.instance_permissions(request):
+            return error
+        return super().destroy(request, *args, **kwargs)
+
+
+class MessageView(viewsets.ModelViewSet):
+    queryset = Message.objects.all()
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    serializer_class = MessageSerializer
+    filterset_fields = ["id", "intent__id"]
+
+
+class UserFeedbackAPIViewSet(viewsets.ModelViewSet):
+    serializer_class = UserFeedbackSerializer
+    queryset = UserFeedback.objects.all()
+    permission_classes = [AllowAny]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["id", "message_source", "message_target"]
+
+    def check_object_permissions(self, request, obj):
+        if obj.message_source.conversation.authentication_required:
+            if not request.user.is_authenticated:
+                raise exceptions.NotAuthenticated()
+        return super().check_object_permissions(request, obj)
+
+
+class AdminReviewAPIViewSet(viewsets.ModelViewSet):
+    serializer_class = AdminReviewSerializer
+    queryset = AdminReview.objects.all()
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["id", "message"]
+
+
+class SenderAPIView(CreateAPIView, UpdateAPIView):
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["id", "message"]
+
+    def get(self, request):
+        return JsonResponse(
+            list(
+                Message.objects.filter(sender__type=AgentType.human.value)
+                .values_list("sender__id", flat=True)
+                .distinct()
+            ),
+            safe=False,
+        )
+
+
+class ConsumerRoundRobinQueueViewSet(mixins.RetrieveModelMixin,
+                   mixins.ListModelMixin,
+                   GenericViewSet):
+    serializer_class = ConsumerRoundRobinQueueSerializer
+    queryset = ConsumerRoundRobinQueue.objects.all()
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["id"]
+
+
+class Stats(APIView):
+    def get(self, request):
+        serializer = StatsSerializer(data=request.GET)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        min_date = data.get("min_date", None)
+        max_date = data.get("max_date", None)
+        granularity = data.get("granularity", None)
+
+        # ----------- Conversations -----------
+        conversations = Conversation.objects
+        if min_date:
+            conversations = conversations.filter(created_date__gte=min_date)
+        if max_date:
+            conversations = conversations.filter(created_date__lte=max_date)
+
+
+        # --- Total conversations
+        total_conversations = conversations.count()
+        # --- Message count per conversation
+        conversations_message_count = conversations.annotate(
+            count=Count("message")
+        ).values("count", "name")
+        # average of conversations_message_count
+        conversations_message_avg = conversations.annotate(
+            count=Count("message")
+        ).aggregate(avg=Avg("count"))
+        # --- Conversations by date
+        conversations_by_date = conversations.annotate(
+            date=Trunc("created_date", granularity)
+        ).values("created_date").annotate(count=Count("id"))
+
+        # ----------- Messages -----------
+        messages = Message.objects
+        if min_date:
+            messages = messages.filter(created_date__gte=min_date)
+        if max_date:
+            messages = messages.filter(created_date__lte=max_date)
+
+        messages = messages.all()
+
+
+        messages_with_prev = messages.filter(prev__isnull=False)
+        general_stats = calculate_general_stats(messages_with_prev, messages_with_prev.count())
+        # ----------- Reviews and Feedbacks -----------
+        admin_reviews = AdminReview.objects.filter(message__in=messages)
+        user_feedbacks = UserFeedback.objects.filter(message__in=messages, value__isnull=False)
+        reviews_and_feedbacks = calculate_response_stats(admin_reviews, user_feedbacks)
+
+        positive_admin_reviews = admin_reviews.filter(ki_review_data__contains=[{"value": "positive"}]).count()
+        total_admin_reviews = admin_reviews.filter(
+            Q(ki_review_data__contains=[{"value": "positive"}]) | Q(ki_review_data__contains=[{"value": "negative"}])
+        ).count()
+        total_admin_relevant_reviews = admin_reviews.filter(
+            Q(ki_review_data__contains=[{"value": "positive"}]) | Q(ki_review_data__contains=[{"value": "alternative"}])
+        ).count()
+        precision = positive_admin_reviews / total_admin_reviews if total_admin_reviews > 0 else 0
+        recall = positive_admin_reviews / total_admin_relevant_reviews if total_admin_relevant_reviews > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+        return JsonResponse(
+            {
+                "total_conversations": total_conversations,
+                "conversations_message_count": list(conversations_message_count.all()),
+                "conversations_message_avg": round(conversations_message_avg.get('avg'), 2) if conversations_message_avg is not None else None,
+                "total_messages": messages.count(),  # Change this line
+                "conversations_by_date": list(conversations_by_date.all()),
+                **general_stats,
+                **reviews_and_feedbacks,
+                "precision": round(precision, 2) if precision is not None else None,
+                "recall": round(recall, 2) if recall is not None else None,
+                "f1": round(f1, 2) if f1 is not None else None,
+            },
+            safe=False,
+        )
+
+
+class FileUploadView(APIView):
+    """
+    API View for secure file upload and retrieval using presigned URLs.
+    
+    POST: Upload a file to private storage and return metadata with presigned URL
+    GET: Retrieve a presigned URL for an existing file
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request, format=None):
+        """Upload a file to private storage and return presigned URL for access."""
+        file = request.FILES.get('file')
+        if not file:
+            return Response(
+                {'error': 'No file provided'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Get expiration time from request (default 1 hour)
+            expire_seconds = int(request.data.get('expire', 3600))
+            if expire_seconds > 86400:  # Max 24 hours
+                expire_seconds = 86400
+            
+            # Use private storage for security
+            private_storage = select_private_storage()
+            
+            # Save the file with a unique name
+            file_name = private_storage.save(file.name, file)
+            
+            # Generate presigned URL for GET access
+            if hasattr(private_storage, 'generate_presigned_url_get'):
+                # S3 storage
+                presigned_url = private_storage.generate_presigned_url_get(
+                    file_name, 
+                    expires_in=expire_seconds
+                )
+            else:
+                # Local storage fallback
+                presigned_url = private_storage.url(file_name)
+            
+            return Response({
+                'file_name': file_name,
+                'content_type': file.content_type,
+                'presigned_url': presigned_url,
+                'expires_in': expire_seconds
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to upload file: {str(e)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def get(self, request, format=None):
+        """Generate a new presigned URL for an existing file."""
+        file_name = request.query_params.get('file_name')
+        if not file_name:
+            return Response(
+                {'error': 'file_name parameter is required'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Get expiration time from request (default 1 hour)
+            expire_seconds = int(request.query_params.get('expire', 3600))
+            if expire_seconds > 86400:  # Max 24 hours
+                expire_seconds = 86400
+                
+            private_storage = select_private_storage()
+            
+            # Check if file exists
+            if not private_storage.exists(file_name):
+                return Response(
+                    {'error': 'File not found'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Generate presigned URL for GET access
+            if hasattr(private_storage, 'generate_presigned_url_get'):
+                # S3 storage
+                presigned_url = private_storage.generate_presigned_url_get(
+                    file_name, 
+                    expires_in=expire_seconds
+                )
+            else:
+                # Local storage fallback
+                presigned_url = private_storage.url(file_name)
+            
+            # Get file metadata
+            file_size = private_storage.size(file_name)
+            
+            return Response({
+                'file_name': file_name,
+                'size': file_size,
+                'presigned_url': presigned_url,
+                'expires_in': expire_seconds
+            }, status=status.HTTP_200_OK)
+            
+        except ValueError:
+            return Response(
+                {'error': 'Invalid expire parameter. Must be a number.'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to generate presigned URL: {str(e)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

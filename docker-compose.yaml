@@ -1,0 +1,161 @@
+---
+version: "3.8"
+services:
+
+  postgres:
+    image: ankane/pgvector:v0.5.0 #postgres:15-alpine
+    container_name: postgres
+    hostname: postgres
+    volumes:
+      - chatfaq_db_data:/var/lib/postgresql/data/
+    environment:
+      - PGDATA=/var/lib/postgresql/data/pgdata/
+      - POSTGRES_USER=chatfaq
+      - POSTGRES_PASSWORD=chatfaq
+      - POSTGRES_DB=chatfaq
+    networks:
+      - chatfaq_db_net
+  redis:
+    image: redis:6.2-alpine
+    hostname: redis
+    # ports:
+    #   - '6379:6379'
+    networks:
+      - chatfaq_db_net
+    # command: redis-server --save 20 1 --loglevel warning --requirepass eYVX7EwVmmxKPCDmwMtyKVge8oLd2t81
+    # volumes:
+    #   - cache:/data
+  back:
+    build:
+      context: back
+      dockerfile: Dockerfile
+    image: chatfaq_back
+    container_name: chatfaq_back
+    hostname: back
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      ray:
+        condition: service_healthy
+    ports:
+      - 8000:8000
+    networks:
+      - default
+      - chatfaq_db_net
+      - chatfaq_back_net
+      - chatfaq_state_machine_net
+    # volumes:
+    #   - ./back/back:/back
+  ray:
+    build:
+      context: back
+      dockerfile: Dockerfile
+      args:
+        - INSTALL_CHAT_RAG=true
+    image: chatfaq-develop-ray
+    container_name: chatfaq_ray
+    hostname: ray
+    command:
+      - /.venv/bin/ray
+      - start
+      - --head
+      - --port=6375
+      - --dashboard-host=0.0.0.0
+      - --dashboard-port=8265
+      - --metrics-export-port=8080
+      - --num-cpus=0
+      - --num-gpus=0
+      - '--object-store-memory=500000000'
+      - '--resources={"tasks":100,"ai_components":100}'
+      - --block
+    ports:
+      - 8265:8265
+    healthcheck:
+      test:
+        - CMD
+        - /.venv/bin/python
+        - -c
+        - >-
+          import socket; s=socket.create_connection(("127.0.0.1",6375),2); s.close()
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - default
+      - chatfaq_db_net
+      - chatfaq_back_net
+      - chatfaq_state_machine_net
+    environment:
+      - CUDA_VISIBLE_DEVICES=
+    shm_size: '1gb'
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+    # extra_hosts:
+    #     - host.docker.internal:host-gateway
+
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: chatfaq_vllm
+  #   command: ["python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Qwen/Qwen1.5-0.5B-Chat", "--port", "5000", "--max-model-len", "8192", "--swap-space", "1"]
+  #   ports:
+  #     - 5000:5000
+  #   networks:
+  #     - default
+  #     - chatfaq_back_net
+
+  state-machine:
+    build:
+      context: sdk
+      dockerfile: Dockerfile
+    image: chatfaq_fsm
+    container_name: chatfaq_fsm
+    hostname: fsm
+    depends_on:
+      - back
+    networks:
+      - chatfaq_state_machine_net
+    volumes:
+      - ./sdk/chatfaq_sdk:/chatfaq_sdk
+      - ./sdk/examples:/examples
+
+  widget:
+    build:
+      context: widget
+      dockerfile: Dockerfile
+    image: chatfaq_widget
+    container_name: chatfaq_widget
+    depends_on:
+      - back
+    ports:
+      - 3003:3000
+    networks:
+      - default
+
+  admin:
+    build:
+      context: admin
+      dockerfile: Dockerfile
+    image: chatfaq_admin
+    container_name: chatfaq_admin
+    depends_on:
+      - back
+    ports:
+      - 3000:3000
+    networks:
+      - default
+
+volumes:
+  chatfaq_db_data:
+
+networks:
+  chatfaq_db_net:
+  chatfaq_back_net:
+  chatfaq_state_machine_net:

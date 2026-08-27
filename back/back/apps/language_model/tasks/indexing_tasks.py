@@ -1,0 +1,286 @@
+import json
+import os
+from logging import getLogger
+
+import pandas as pd
+import ray
+from django.db.models import F
+
+from back.apps.language_model.models.enums import (
+    IndexStatusChoices,
+    RetrieverTypeChoices,
+)
+from back.utils.ray_utils import ray_task
+
+
+logger = getLogger(__name__)
+
+
+@ray_task(num_cpus=1, resources={"tasks": 1})
+def generate_embeddings_task(data):
+
+    from chat_rag.embedding_models import E5Model
+
+    embedding_model = E5Model(
+        model_name=data["model_name"],
+        use_cpu=data["device"] == "cpu",
+        huggingface_key=os.environ.get("HUGGINGFACE_API_KEY", None),
+    )
+
+    embeddings = embedding_model.build_embeddings(
+        contents=data["contents"], batch_size=data["batch_size"], prefix="passage: "
+    )
+
+    # from tensor to list
+    embeddings = [embedding.tolist() for embedding in embeddings]
+
+    return embeddings
+
+
+def get_modified_k_items_ids(retriever_config):
+    """
+    Get the ids of the k items that have been modified.
+    Parameters
+    ----------
+    retriever_config : RetrieverConfig
+        The RetrieverConfig object.
+    Returns
+    -------
+    modified_k_item_ids : list
+        A list of primary keys of the KnowledgeItem objects.
+    """
+    from back.apps.language_model.models import Embedding
+
+    modified_k_item_ids = list(
+        Embedding.objects.filter(
+            retriever_config=retriever_config,
+            updated_date__lt=F("knowledge_item__updated_date"),
+        ).values_list("knowledge_item__pk", flat=True)
+    )
+
+    return modified_k_item_ids
+
+
+def generate_embeddings(k_items, retriever_config):
+    """
+    Generate the embeddings for a knowledge base.
+    Parameters
+    ----------
+    ki_ids : list
+        A list of primary keys of the KnowledgeItem objects.
+    retriever_config : RetrieverConfig
+        The RetrieverConfig object.
+    """
+    from back.apps.language_model.models import Embedding
+
+    model_name = retriever_config.model_name
+    batch_size = retriever_config.batch_size
+    device = retriever_config.get_device().value
+    logger.info(
+        f"Generating embeddings for {k_items.count()} knowledge items. Knowledge base: {retriever_config.knowledge_base.name}"
+    )
+    logger.info(f"Retriever model: {model_name}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Device: {device}")
+
+    contents = [item.content for item in k_items]
+    data = {
+        "model_name": model_name,
+        "device": device,
+        "contents": contents,
+        "batch_size": batch_size,
+    }
+
+    # Submit the task to the Ray cluster
+    num_gpus = 1 if device == "cuda" else 0
+    task_name = f"generate_embeddings_{retriever_config.name}"
+    embeddings_ref = generate_embeddings_task.options(resources={"tasks": 1}, num_gpus=num_gpus, name=task_name).remote(data)
+    embeddings = ray.get(embeddings_ref)
+
+    new_embeddings = [
+        Embedding(
+            knowledge_item=item,
+            retriever_config=retriever_config,
+            embedding=embedding,
+        )
+        for item, embedding in zip(k_items, embeddings)
+    ]
+    Embedding.objects.bulk_create(new_embeddings)
+    logger.info(
+        f"Embeddings generated for knowledge base: {retriever_config.knowledge_base.name}"
+    )
+
+
+def index_e5(retriever_config):
+    """
+    Generate the embeddings for a knowledge base for the E5 retriever.
+    """
+    from back.apps.language_model.models import Embedding, KnowledgeItem
+
+    # When a k item is deleted, its embedding is also deleted in cascade, so we need to remove the embeddings of only the modified k items
+    # get the modified k items ids
+    modified_k_item_ids = get_modified_k_items_ids(retriever_config)
+
+    logger.info(f"Number of modified k items: {len(modified_k_item_ids)}")
+
+    # remove the embeddings of the modified k items
+    Embedding.objects.filter(knowledge_item__pk__in=modified_k_item_ids).delete()
+
+    # get the k items that have no associated embeddings
+    k_items = KnowledgeItem.objects.filter(
+        knowledge_base=retriever_config.knowledge_base
+    ).exclude(embedding__retriever_config=retriever_config)
+
+    generate_embeddings(k_items=k_items, retriever_config=retriever_config)
+
+
+def get_indexed_k_items_ids(s3_index_path):
+
+    from django.conf import settings
+    from back.config.storage_backends import select_private_storage
+
+
+    if settings.LOCAL_STORAGE:
+
+        print(f"Reading index from local storage: {s3_index_path}")
+
+        index_root, index_name = os.path.split(s3_index_path)
+
+        print(f"Index root: {index_root}, Index name: {index_name}")
+
+        index_path = os.path.join(index_root, 'colbert', 'indexes', index_name)
+
+        print(f"Final index path: {index_path}")
+
+        # get the filename of the pid_docid_map file
+        files = os.listdir(index_path)
+        filename = [file for file in files if file.startswith('pid_docid_map')][0]
+        local_file_path = os.path.join(index_path, filename)
+
+        print(f"Local file path: {local_file_path}")
+
+        # As it is a local storage, we store the files as saved by ColBERT
+        with open(local_file_path, "rb") as local_file:
+            pid_docid_map = json.loads(local_file.read())
+
+    else:
+        private_storage = select_private_storage()
+
+        print(f"Reading index from S3: {s3_index_path}")
+
+        files = private_storage.listdir(s3_index_path)[1]
+        local_index_path = f"/tmp/{s3_index_path}"
+
+        print(f"We will download the pid docid map to {local_index_path}")
+
+        filename = [file for file in files if file.startswith('pid_docid_map')][0]
+
+        if not os.path.exists(local_index_path):
+            os.makedirs(local_index_path)
+
+        s3_file_path = os.path.join(s3_index_path, filename)
+
+        print(f"Downloading {filename} from {s3_file_path}")
+
+        local_file_path = os.path.join(local_index_path, filename)
+        with open(local_file_path, "wb") as local_file:
+            local_file.write(private_storage.open(s3_file_path).read())
+
+        print(f"Downloaded {filename} to {local_file_path}")
+
+        df = pd.read_parquet(local_file_path)
+
+        pid_docid_map = json.loads(df['bytes'][0])
+
+    indexed_k_item_ids = [int(id) for id in set(pid_docid_map.values())]
+
+    return indexed_k_item_ids
+
+
+def index_colbert(retriever_config):
+    """
+    Build the index for a knowledge base.
+    Parameters
+    ----------
+    retriever_config : 
+        The RetrieverConfig object.
+    """
+    raise NotImplementedError("ColBERT has been deprecated. Please use the E5 retriever instead.")
+
+
+@ray_task(num_cpus=0.2, resources={"tasks": 1})
+def delete_index_files(s3_index_path):
+    """
+    Delete the index files from S3.
+    Parameters
+    ----------
+    s3_index_path : str
+        The unique index path.
+    """
+    from django.conf import settings
+    from back.config.storage_backends import select_private_storage
+    import shutil
+
+    if s3_index_path:
+
+        if settings.LOCAL_STORAGE:
+            index_root, index_name = os.path.split(s3_index_path)
+            index_path = os.path.join(index_root, 'colbert', 'indexes', index_name)
+            print(f'Deleting local index files from {index_path}')
+            if os.path.exists(index_path):
+                shutil.rmtree(index_path)
+
+        else: # for s3 and do
+            private_storage = select_private_storage()
+            logger.info(f"Deleting index files from S3: {s3_index_path}")
+            # List all files in the unique index path
+            _, files = private_storage.listdir(s3_index_path)
+            for file in files:
+                # Construct the full path for each file
+                file_path = os.path.join(s3_index_path, file)
+                # Delete the file from S3
+                private_storage.delete(file_path)
+
+            logger.info(f"Index files deleted from S3: {s3_index_path}")
+
+
+@ray_task(num_cpus=0.5, resources={"tasks": 1})
+def index_task(retriever_config_id, launch_retriever_deploy: bool = False):
+    """
+    Build the index for a knowledge base.
+    Parameters
+    ----------
+    retriever_config_id : int
+        The primary key of the RetrieverConfig object.
+    launch_retriever_deploy : bool
+        Whether to launch the retriever deployment after the index is built.
+    """
+    from back.apps.language_model.models import RetrieverConfig, Embedding
+
+
+    retriever_config = RetrieverConfig.objects.get(pk=retriever_config_id)
+
+    retriever_type = retriever_config.get_retriever_type()
+
+    # if no_index, remove all retriever config embeddings for a clean start and no leftovers
+    if retriever_config.get_index_status() == IndexStatusChoices.NO_INDEX:
+        Embedding.objects.filter(retriever_config=retriever_config).delete()
+
+        # remove the index files from S3
+        task_name = f"delete_index_files_{retriever_config.name}"
+        print(f"Submitting the {task_name} task to the Ray cluster...")
+        delete_index_files.options(name=task_name).remote(retriever_config.s3_index_path)
+
+    if retriever_type == RetrieverTypeChoices.E5:
+        index_e5(retriever_config)
+    elif retriever_type == RetrieverTypeChoices.COLBERT:
+        index_colbert(retriever_config)
+
+    retriever_config.index_status = IndexStatusChoices.UP_TO_DATE
+    retriever_config.save()
+
+    logger.info(f"Index built for knowledge base: {retriever_config.knowledge_base.name}")
+
+    # launch retriever
+    if launch_retriever_deploy:
+        retriever_config.trigger_deploy()

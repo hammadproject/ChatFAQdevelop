@@ -1,0 +1,32 @@
+---
+name: ChatFAQ
+
+on:
+  push:
+    paths:
+      - "admin/**"
+      - "back/**"
+      - "sdk/**"
+      - "widget/**"
+      - "Dogefile"
+    branches:
+      - "production"
+      - "develop"
+      # - "feature/**caps**"
+      # - "feature/**withmadrid**"
+      # - "feature/**chatf**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via DogeOps
+        uses: WithAgency/dogeops-action@v1
+        with:
+          api_url: ${{ vars.DOGEOPS_API_URL }}
+          api_key: ${{ secrets.DOGEOPS_API_KEY }}

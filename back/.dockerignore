@@ -1,0 +1,13 @@
+*
+
+!pyproject.toml
+!poetry.lock
+!manage.py
+!__init__.py
+!back/
+!README.md
+!Makefile
+!pmanage
+!model-w.toml
+!starter_script.sh
+!sources.list
